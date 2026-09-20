@@ -2,10 +2,12 @@ package managerclient
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
 	"connectrpc.com/connect"
+	"golang.org/x/oauth2"
 )
 
 const maxResponseBytes = 64 * 1024 * 1024
@@ -28,17 +30,63 @@ func NewConnectHTTPClient() *http.Client {
 	}
 }
 
+// ConnectClientOptions builds Connect options for a static manager-token.
+// It always sends Cicd-Sensor-Token-Type: manager-token.
 func ConnectClientOptions(token string) []connect.ClientOption {
-	return []connect.ClientOption{
-		connect.WithReadMaxBytes(maxResponseBytes),
-		withBearerToken(token),
+	return ConnectClientOptionsWithAuth(StaticTokenAuth(token))
+}
+
+// ClientAuth describes how manager Connect clients obtain credentials.
+type ClientAuth struct {
+	TokenType   string
+	Token       string
+	TokenSource oauth2.TokenSource
+}
+
+// StaticTokenAuth is the default manager-token path.
+func StaticTokenAuth(token string) ClientAuth {
+	return ClientAuth{
+		TokenType: TokenTypeManagerToken,
+		Token:     token,
 	}
 }
 
-func withBearerToken(token string) connect.ClientOption {
+// IDTokenAuth uses a refreshing OIDC TokenSource.
+func IDTokenAuth(src oauth2.TokenSource) ClientAuth {
+	return ClientAuth{
+		TokenType:   TokenTypeIDToken,
+		TokenSource: src,
+	}
+}
+
+// ConnectClientOptionsWithAuth sets Authorization and Cicd-Sensor-Token-Type.
+func ConnectClientOptionsWithAuth(auth ClientAuth) []connect.ClientOption {
+	tokenType := auth.TokenType
+	if tokenType == "" {
+		tokenType = TokenTypeManagerToken
+	}
+	return []connect.ClientOption{
+		connect.WithReadMaxBytes(maxResponseBytes),
+		withClientAuth(auth.Token, auth.TokenSource, tokenType),
+	}
+}
+
+func withClientAuth(staticToken string, src oauth2.TokenSource, tokenType string) connect.ClientOption {
 	return connect.WithInterceptors(connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
 		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			token := staticToken
+			if src != nil {
+				tok, err := src.Token()
+				if err != nil {
+					return nil, connect.NewError(connect.CodeUnavailable, fmt.Errorf("%w", err))
+				}
+				token = tok.AccessToken
+			}
+			if token == "" {
+				return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("manager credential is empty"))
+			}
 			req.Header().Set(authorizationHeader, "Bearer "+token)
+			req.Header().Set(TokenTypeHeader, tokenType)
 			return next(ctx, req)
 		}
 	}))

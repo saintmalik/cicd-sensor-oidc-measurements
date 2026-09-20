@@ -1,0 +1,170 @@
+# Same-job colocated Manager OIDC e2e (prod crypto path).
+#
+# Proves: real GitHub Actions ID token mint → Manager verify via real GitHub
+# JWKS (go-oidc RemoteKeySet) → exact-claim allowlist → JobIdentity bind →
+# FetchConfig + ForceRefresh remint. Also proves reject paths.
+#
+# Pattern: Manager listens on localhost in the SAME job (no public ingress).
+# Crypto path is production; deployment topology is CI e2e colocated.
+
+name: OIDC Manager Auth E2E (prod path)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - e2e/**
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Manager + e2e harness
+        run: |
+          set -euo pipefail
+          mkdir -p bin /tmp/oidc-manager-auth-e2e
+          go build -mod=vendor -o bin/cicd-sensor-manager ./cmd/cicd-sensor-manager
+          go build -mod=vendor -o bin/oidc-manager-auth-e2e ./cmd/oidc-manager-auth-e2e
+
+      - name: Write Manager configs (allow + deny allowlists)
+        env:
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          AUDIENCE="http://127.0.0.1:18080"
+          python3 <<'PY'
+          import os, textwrap, pathlib
+          audience = "http://127.0.0.1:18080"
+          repo = os.environ["REPO"]
+          owner = os.environ["OWNER"]
+          out = pathlib.Path("/tmp/oidc-manager-auth-e2e")
+          out.mkdir(parents=True, exist_ok=True)
+          allow = textwrap.dedent(f"""\
+          bind:
+            address: 127.0.0.1
+            port: 18080
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: {audience}
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - repository: {repo}
+                  repository_owner: {owner}
+          """)
+          deny = textwrap.dedent(f"""\
+          bind:
+            address: 127.0.0.1
+            port: 18081
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: {audience}
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - repository: other-org/definitely-not-this-repo
+                  repository_owner: other-org
+          """)
+          (out / "manager-allow.yaml").write_text(allow)
+          (out / "manager-deny.yaml").write_text(deny)
+          print(allow)
+          PY
+          echo "AUDIENCE=${AUDIENCE}" >> "$GITHUB_ENV"
+          echo "Wrote allow/deny Manager configs for repository=${REPO}"
+
+      - name: Start colocated Managers (OIDC-only, real GitHub JWKS)
+        run: |
+          set -euo pipefail
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-manager-auth-e2e/manager-allow.yaml \
+            > /tmp/oidc-manager-auth-e2e/manager-allow.log 2>&1 &
+          echo $! > /tmp/oidc-manager-auth-e2e/manager-allow.pid
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-manager-auth-e2e/manager-deny.yaml \
+            > /tmp/oidc-manager-auth-e2e/manager-deny.log 2>&1 &
+          echo $! > /tmp/oidc-manager-auth-e2e/manager-deny.pid
+          for i in $(seq 1 40); do
+            code_a=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)
+            code_b=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/ || true)
+            # Auth middleware answers 401 without a bearer — that means the listener is up.
+            if [ "$code_a" = "401" ] && [ "$code_b" = "401" ]; then
+              echo "Managers listening on 18080 and 18081 (HTTP 401 unauthenticated probe)"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Managers failed to start" >&2
+          echo "--- allow log ---"; cat /tmp/oidc-manager-auth-e2e/manager-allow.log || true
+          echo "--- deny log ---"; cat /tmp/oidc-manager-auth-e2e/manager-deny.log || true
+          exit 1
+
+      - name: Run prod-path OIDC e2e
+        env:
+          MANAGER_URL: http://127.0.0.1:18080
+          MANAGER_DENY_URL: http://127.0.0.1:18081
+          MANAGER_AUDIENCE: ${{ env.AUDIENCE }}
+          E2E_RESULTS_PATH: /tmp/oidc-manager-auth-e2e/results.json
+        run: |
+          set -euo pipefail
+          ./bin/oidc-manager-auth-e2e
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## OIDC Manager Auth E2E (prod path)'
+            echo
+            echo 'Same-job colocated Manager; **real** GitHub issuer + JWKS (not fake-issuer).'
+            echo
+            echo '- Issuer: `https://token.actions.githubusercontent.com`'
+            echo '- JWKS: `https://token.actions.githubusercontent.com/.well-known/jwks`'
+            echo "- Audience: \`${AUDIENCE:-http://127.0.0.1:18080}\`"
+            echo "- Repository allowlist: \`${{ github.repository }}\`"
+            echo
+            if [ -f /tmp/oidc-manager-auth-e2e/results.json ]; then
+              echo '### Results'
+              echo '```json'
+              cat /tmp/oidc-manager-auth-e2e/results.json
+              echo '```'
+            fi
+            echo
+            echo '### Manager allow log (tail)'
+            echo '```'
+            tail -n 80 /tmp/oidc-manager-auth-e2e/manager-allow.log 2>/dev/null || echo '(missing)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-manager-auth-e2e
+          path: |
+            /tmp/oidc-manager-auth-e2e/results.json
+            /tmp/oidc-manager-auth-e2e/manager-allow.log
+            /tmp/oidc-manager-auth-e2e/manager-deny.log
+            /tmp/oidc-manager-auth-e2e/manager-allow.yaml
+            /tmp/oidc-manager-auth-e2e/manager-deny.yaml
+          if-no-files-found: warn
+
+      - name: Stop Managers
+        if: always()
+        run: |
+          for f in /tmp/oidc-manager-auth-e2e/manager-allow.pid /tmp/oidc-manager-auth-e2e/manager-deny.pid; do
+            if [ -f "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi
+          done

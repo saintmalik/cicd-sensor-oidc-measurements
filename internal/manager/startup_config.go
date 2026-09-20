@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cicd-sensor/cicd-sensor/internal/logtype"
+	oidcauth "github.com/cicd-sensor/cicd-sensor/internal/managerauth/oidc"
 	"github.com/cicd-sensor/cicd-sensor/internal/rule"
 	"go.yaml.in/yaml/v4"
 )
@@ -28,12 +29,55 @@ const (
 type StartupConfig struct {
 	Revision                string            `yaml:"-"`
 	Bind                    startupBindConfig `yaml:"bind"`
+	Auth                    AuthConfig        `yaml:"auth,omitempty"`
 	DefaultMaxAlertsPerRule int               `yaml:"default_max_alerts_per_rule,omitempty"`
 	DisableBaselineRules    bool              `yaml:"disable_baseline_rules,omitempty"`
 	MonitorMode             bool              `yaml:"monitor_mode,omitempty"`
 	RedactProcessArgs       *bool             `yaml:"redact_process_args,omitempty"`
 	Sinks                   SinksConfig       `yaml:"sinks,omitempty"`
 	Logs                    LogsConfig        `yaml:"logs,omitempty"`
+}
+
+// AuthConfig holds optional authentication settings beyond manager tokens.
+type AuthConfig struct {
+	OIDC OIDCAuthConfig `yaml:"oidc,omitempty"`
+}
+
+// OIDCAuthConfig is the GitHub Actions OIDC verification settings.
+type OIDCAuthConfig struct {
+	Enabled  bool                 `yaml:"enabled,omitempty"`
+	Issuer   string               `yaml:"issuer,omitempty"`
+	Audience string               `yaml:"audience,omitempty"`
+	JWKSURL  string               `yaml:"jwks_url,omitempty"`
+	Allow    []OIDCAllowlistEntry `yaml:"allow,omitempty"`
+}
+
+// OIDCAllowlistEntry is one exact-claim allowlist grant from manager.yaml.
+type OIDCAllowlistEntry struct {
+	RepositoryOwner   string `yaml:"repository_owner,omitempty"`
+	Repository        string `yaml:"repository,omitempty"`
+	RepositoryOwnerID string `yaml:"repository_owner_id,omitempty"`
+	RepositoryID      string `yaml:"repository_id,omitempty"`
+}
+
+// OIDCConfig converts YAML auth.oidc into the verifier config type.
+func (cfg StartupConfig) OIDCConfig() oidcauth.Config {
+	allow := make([]oidcauth.AllowEntry, 0, len(cfg.Auth.OIDC.Allow))
+	for _, entry := range cfg.Auth.OIDC.Allow {
+		allow = append(allow, oidcauth.AllowEntry{
+			RepositoryOwner:   entry.RepositoryOwner,
+			Repository:        entry.Repository,
+			RepositoryOwnerID: entry.RepositoryOwnerID,
+			RepositoryID:      entry.RepositoryID,
+		})
+	}
+	return oidcauth.Config{
+		Enabled:  cfg.Auth.OIDC.Enabled,
+		Issuer:   cfg.Auth.OIDC.Issuer,
+		Audience: cfg.Auth.OIDC.Audience,
+		JWKSURL:  cfg.Auth.OIDC.JWKSURL,
+		Allow:    allow,
+	}
 }
 
 // SinksConfig maps an operator-defined sink name to its physical destination.
@@ -88,6 +132,9 @@ func LoadStartupConfig(path string) (StartupConfig, error) {
 		return StartupConfig{}, err
 	}
 	if err := validateLogs(cfg.Logs, cfg.Sinks); err != nil {
+		return StartupConfig{}, err
+	}
+	if err := cfg.OIDCConfig().Validate(); err != nil {
 		return StartupConfig{}, err
 	}
 	sum := sha256.Sum256(data)

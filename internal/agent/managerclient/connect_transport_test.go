@@ -31,6 +31,9 @@ func TestConnectClientOptions_AddsBearerToken(t *testing.T) {
 			if got, want := req.Header().Get("Authorization"), "Bearer "+testManagerToken; got != want {
 				t.Fatalf("authorization: got %q, want %q", got, want)
 			}
+			if got, want := req.Header().Get(managerclient.TokenTypeHeader), managerclient.TokenTypeManagerToken; got != want {
+				t.Fatalf("token type: got %q, want %q", got, want)
+			}
 			return connect.NewResponse(&managerv1beta1.FetchConfigResponse{}), nil
 		},
 	}

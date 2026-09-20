@@ -1,6 +1,6 @@
 # Normal-user style OIDC Manager auth demo on a private self-hosted Linux lab runner.
 #
-# Operator path: long-lived Manager (systemd) + host Agent (systemd) + MinIO sink.
+# Operator path: long-lived Manager (systemd) + host Agent (systemd) + moto S3 sink.
 # CI user path: id-token: write → project start (oidc) → real work → long remint window
 # → project result (ForceRefresh) → verify sink received logs.
 #
@@ -58,53 +58,61 @@ jobs:
           sudo install -m 0755 bin/cicd-sensor /opt/cicd-sensor/cicd-sensor
           sudo install -m 0755 bin/cicd-sensor-manager /opt/cicd-sensor/cicd-sensor-manager
 
-      - name: Operator — install MinIO sink binary
+      - name: Operator — install S3-compatible sink (moto)
         run: |
           set -euo pipefail
-          if [ ! -x /usr/local/bin/minio ]; then
-            curl -fsSL -o /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
-            sudo install -m 0755 /tmp/minio /usr/local/bin/minio
+          if [ ! -x "$HOME/oidc-sink-venv/bin/python" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip
+            python3 -m venv "$HOME/oidc-sink-venv"
+            "$HOME/oidc-sink-venv/bin/pip" install -q "moto[s3,server]==5.1.1" boto3
           fi
-          if [ ! -x /usr/local/bin/mc ]; then
-            curl -fsSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc
-            sudo install -m 0755 /tmp/mc /usr/local/bin/mc
-          fi
-          minio --version
-          mc --version
+          "$HOME/oidc-sink-venv/bin/python" -c 'import moto, boto3; print("sink deps ok")'
 
-      - name: Operator — start MinIO (S3-compatible sink)
+      - name: Operator — start moto S3 sink
         run: |
           set -euo pipefail
-          sudo mkdir -p "$DEMO_ROOT/minio-data" "$DEMO_ROOT/logs"
-          sudo tee /etc/systemd/system/cicd-sensor-oidc-minio.service >/dev/null <<EOF
+          sudo mkdir -p "$DEMO_ROOT/logs"
+          sudo tee /etc/systemd/system/cicd-sensor-oidc-s3sink.service >/dev/null <<EOF
           [Unit]
-          Description=cicd-sensor OIDC lab MinIO sink
+          Description=cicd-sensor OIDC lab S3 sink (moto)
           After=network-online.target
           Wants=network-online.target
 
           [Service]
           Type=simple
-          User=root
-          Environment=MINIO_ROOT_USER=${MINIO_ROOT_USER}
-          Environment=MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-          ExecStart=/usr/local/bin/minio server ${DEMO_ROOT}/minio-data --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
+          User=$(whoami)
+          WorkingDirectory=$HOME
+          ExecStart=$HOME/oidc-sink-venv/bin/python -m moto.server -H 127.0.0.1 -p 9000
           Restart=on-failure
 
           [Install]
           WantedBy=multi-user.target
           EOF
           sudo systemctl daemon-reload
-          sudo systemctl restart cicd-sensor-oidc-minio.service
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-              echo "MinIO healthy"
+          sudo systemctl restart cicd-sensor-oidc-s3sink.service
+          for i in $(seq 1 40); do
+            if curl -fsS -o /dev/null http://127.0.0.1:9000/ 2>/dev/null; then
+              echo "moto S3 listening"
               break
             fi
-            sleep 1
+            sleep 0.5
           done
-          curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null
-          mc alias set oidclab http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
-          mc mb --ignore-existing oidclab/oidc-user-demo
+          "$HOME/oidc-sink-venv/bin/python" <<'PY'
+          import boto3
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="http://127.0.0.1:9000",
+              aws_access_key_id="oidclab",
+              aws_secret_access_key="oidclab-demo-secret",
+              region_name="us-east-1",
+          )
+          try:
+              s3.create_bucket(Bucket="oidc-user-demo")
+          except Exception as e:
+              if "BucketAlreadyOwnedByYou" not in str(e) and "BucketAlreadyExists" not in str(e):
+                  raise
+          print("bucket ready:", s3.list_buckets())
+          PY
 
       - name: Operator — write Manager config (OIDC + S3 sink)
         env:
@@ -161,7 +169,7 @@ jobs:
           sudo tee /etc/systemd/system/cicd-sensor-manager-oidc-lab.service >/dev/null <<EOF
           [Unit]
           Description=cicd-sensor Manager (OIDC lab)
-          After=network-online.target cicd-sensor-oidc-minio.service
+          After=network-online.target cicd-sensor-oidc-s3sink.service
           Wants=network-online.target
 
           [Service]
@@ -287,27 +295,47 @@ jobs:
         id: sink
         run: |
           set -euo pipefail
-          mc alias set oidclab http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
-          # Give Manager a moment to flush
           sleep 3
-          mc ls --recursive oidclab/oidc-user-demo/ | tee /tmp/oidc-user-demo/sink-ls.txt || true
-          count=$(mc ls --recursive oidclab/oidc-user-demo/ 2>/dev/null | wc -l | tr -d ' ')
-          echo "sink_object_count=${count}" >> "$GITHUB_OUTPUT"
-          python3 <<PY
+          "$HOME/oidc-sink-venv/bin/python" <<'PY'
           import json, pathlib
-          count = int("${count}" or "0")
+          import boto3
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="http://127.0.0.1:9000",
+              aws_access_key_id="oidclab",
+              aws_secret_access_key="oidclab-demo-secret",
+              region_name="us-east-1",
+          )
+          keys = []
+          token = None
+          while True:
+              kwargs = {"Bucket": "oidc-user-demo"}
+              if token:
+                  kwargs["ContinuationToken"] = token
+              resp = s3.list_objects_v2(**kwargs)
+              for obj in resp.get("Contents") or []:
+                  keys.append(obj["Key"])
+              if not resp.get("IsTruncated"):
+                  break
+              token = resp.get("NextContinuationToken")
+          listing = "\n".join(keys) if keys else "(none)"
+          pathlib.Path("/tmp/oidc-user-demo/sink-ls.txt").write_text(listing + "\n")
           out = {
-            "ok": count > 0,
-            "sink_object_count": count,
-            "manager_url": "http://127.0.0.1:18080",
-            "auth": "oidc",
-            "note": "MinIO path-style S3 sink behind Manager; objects prove IngestLog after project result",
+              "ok": len(keys) > 0,
+              "sink_object_count": len(keys),
+              "manager_url": "http://127.0.0.1:18080",
+              "auth": "oidc",
+              "note": "moto S3-compatible sink behind Manager; objects prove IngestLog after project result",
+              "keys_sample": keys[:20],
           }
           pathlib.Path("/tmp/oidc-user-demo/sink-verify.json").write_text(json.dumps(out, indent=2) + "\n")
           print(json.dumps(out, indent=2))
-          if count <= 0:
+          print(listing)
+          if not keys:
               raise SystemExit("expected at least one object in Manager sink after project result")
           PY
+          count=$(python3 -c 'import json; print(json.load(open("/tmp/oidc-user-demo/sink-verify.json"))["sink_object_count"])')
+          echo "sink_object_count=${count}" >> "$GITHUB_OUTPUT"
 
       - name: Write demo summary
         if: always()
@@ -318,7 +346,7 @@ jobs:
             echo '- Manager: systemd service on lab runner (real GitHub JWKS + repo allowlist)'
             echo '- Agent: systemd host Agent on lab runner'
             echo '- CI: `project start --manager-auth oidc` → real work → remint sleep → `project result`'
-            echo '- Sink: MinIO (S3-compatible) via Manager'
+            echo '- Sink: moto S3-compatible store via Manager'
             echo
             echo '### Sink verify'
             echo '```json'
@@ -347,10 +375,11 @@ jobs:
           set +e
           sudo systemctl stop cicd-sensor-agent-oidc-lab.service
           sudo systemctl stop cicd-sensor-manager-oidc-lab.service
-          sudo systemctl stop cicd-sensor-oidc-minio.service
-          sudo systemctl disable cicd-sensor-agent-oidc-lab.service cicd-sensor-manager-oidc-lab.service cicd-sensor-oidc-minio.service 2>/dev/null
+          sudo systemctl stop cicd-sensor-oidc-s3sink.service
+          sudo systemctl disable cicd-sensor-agent-oidc-lab.service cicd-sensor-manager-oidc-lab.service cicd-sensor-oidc-s3sink.service 2>/dev/null
           sudo rm -f /etc/systemd/system/cicd-sensor-agent-oidc-lab.service \
             /etc/systemd/system/cicd-sensor-manager-oidc-lab.service \
+            /etc/systemd/system/cicd-sensor-oidc-s3sink.service \
             /etc/systemd/system/cicd-sensor-oidc-minio.service
           sudo systemctl daemon-reload
           echo "lab services stopped"

@@ -1,0 +1,687 @@
+# Full OIDC Manager Auth validation — every @rung concern + long remint.
+#
+# Private repo only: saintmalik/cicd-sensor-oidc-measurements
+# Long job (~6–10+ min) — do not abort early.
+
+name: OIDC Manager Auth Full Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - e2e/**
+      - validate/**
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  GOFLAGS: -mod=vendor
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: @rung unit/integration checklist (concerns 2–10 covered in tests)
+  # ------------------------------------------------------------------
+  rung-unit-checklist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run @rung concern unit/integration tests
+        id: tests
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-full
+          {
+            echo '## @rung unit/integration checklist'
+            echo
+            echo '| Concern | Package / test | Status |'
+            echo '| --- | --- | --- |'
+          } > /tmp/oidc-full/checklist.md
+
+          run_pkg() {
+            local label="$1"; shift
+            local pkg="$1"; shift
+            echo "::group::${label}"
+            if go test -count=1 -timeout 120s "$pkg" "$@"; then
+              echo "| ${label} | \`${pkg}\` | PASS |" >> /tmp/oidc-full/checklist.md
+              echo "${label}=pass" >> /tmp/oidc-full/checklist.env
+            else
+              echo "| ${label} | \`${pkg}\` | FAIL |" >> /tmp/oidc-full/checklist.md
+              echo "${label}=fail" >> /tmp/oidc-full/checklist.env
+              echo "FAIL:${label}" >> /tmp/oidc-full/failures.txt
+              return 1
+            fi
+            echo "::endgroup::"
+          }
+
+          set +e
+          run_pkg "2 allowlist exact + acme-corp vs acme-corp2 + pins + empty allow" \
+            ./internal/managerauth/oidc/
+          run_pkg "2 allowlist YAML startup rejects (unknown key, slash owner, empty)" \
+            ./internal/manager/ -run 'TestLoadStartupConfig_OIDCAllowlist'
+          run_pkg "3 request_url https + host allowlist" \
+            ./internal/agent/managerclient/ -run 'TestValidateIDTokenRequestURL'
+          run_pkg "3 project start OIDC + rejects non-allowlisted host" \
+            ./internal/agent/listener/ -run 'TestListener_ProjectStart_OIDC'
+          run_pkg "4 interceptor JobIdentity bind + token-type routing" \
+            ./internal/manager/ -run 'TestOIDCJobIdentityInterceptor|TestAuthMiddleware_TokenTypeRouting|TestOIDCFakeIssuer_FetchConfigEndToEnd'
+          run_pkg "5 headers manager-token / id-token" \
+            ./internal/agent/managerclient/ -run 'TestConnectClientOptions_TokenTypeHeaders'
+          run_pkg "6 main.go OIDC-only / manager-token required" \
+            ./cmd/cicd-sensor-manager/ -run 'TestValidateManagerStartupOptions'
+          run_pkg "7 remint concurrent refresh collapsed + ForceRefresh pin + mint Unavailable" \
+            ./internal/agent/managerclient/ -run 'TestReuseIDTokenSource_ConcurrentRefreshCollapsed|TestCachedTokenSource_ForceRefreshForShutdownSummary|TestActionsIDTokenSource_MintFailureUnavailable|TestConnectClientOptions_TokenTypeHeaders'
+          run_pkg "8 JWKS fetching-keys → Unavailable" \
+            ./internal/managerauth/oidc/ -run 'TestVerifier_FetchingKeysUnavailable'
+          run_pkg "8 Manager JWKS Unavailable mapping" \
+            ./internal/manager/ -run 'TestAuthMiddleware_JWKSFetchUnavailable'
+          run_pkg "9 shutdown Summary ForceRefresh on project result" \
+            ./internal/agent/jobregistry/ -run 'TestJobRegistry_RequestGitHubProjectResult_ForceRefreshOIDC'
+          run_pkg "10 GET mint (not POST) in listener OIDC path" \
+            ./internal/agent/listener/ -run 'TestListener_ProjectStart_OIDCManagerPath'
+          set -e
+
+          cat /tmp/oidc-full/checklist.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/oidc-full/failures.txt ]; then
+            echo "Unit checklist had failures" >&2
+            cat /tmp/oidc-full/failures.txt >&2
+            exit 1
+          fi
+          echo '{"ok":true,"job":"rung-unit-checklist"}' > /tmp/oidc-full/unit-ok.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oidc-full-unit-checklist
+          path: /tmp/oidc-full/
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------
+  # Job 2: Long remint (>300s) + rejects + IngestLog (LocalStack sink)
+  # Split topology: Manager background processes + separate e2e client
+  # ------------------------------------------------------------------
+  long-remint-and-ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start LocalStack (S3 sink)
+        run: |
+          set -euo pipefail
+          docker run -d --name oidc-localstack -p 4566:4566 \
+            -e SERVICES=s3 \
+            localstack/localstack:3
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:4566/_localstack/health >/dev/null 2>&1; then
+              echo "LocalStack health OK"
+              break
+            fi
+            sleep 1
+          done
+          export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+          # Prefer awslocal if present; else aws with endpoint
+          if command -v awslocal >/dev/null 2>&1; then
+            awslocal s3 mb s3://oidc-e2e || true
+            awslocal s3 ls
+          else
+            pip install -q awscli
+            aws --endpoint-url=http://127.0.0.1:4566 s3 mb s3://oidc-e2e || true
+            aws --endpoint-url=http://127.0.0.1:4566 s3 ls
+          fi
+
+      - name: Build Manager + e2e + agent-path binaries
+        run: |
+          set -euo pipefail
+          mkdir -p bin /tmp/oidc-full
+          go build -mod=vendor -o bin/cicd-sensor-manager ./cmd/cicd-sensor-manager
+          go build -mod=vendor -o bin/oidc-manager-auth-e2e ./cmd/oidc-manager-auth-e2e
+          go build -mod=vendor -o bin/oidc-agent-path-e2e ./cmd/oidc-agent-path-e2e
+          go build -mod=vendor -o bin/cicd-sensor ./cmd/cicd-sensor
+
+      - name: Write Manager configs + startup rejects
+        env:
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          AUDIENCE="http://127.0.0.1:18080"
+          OUT=/tmp/oidc-full
+          python3 <<'PY'
+          import os, pathlib, textwrap, subprocess, sys
+          audience = "http://127.0.0.1:18080"
+          repo = os.environ["REPO"]
+          owner = os.environ["OWNER"]
+          out = pathlib.Path("/tmp/oidc-full")
+          allow = textwrap.dedent(f"""\
+          bind:
+            address: 127.0.0.1
+            port: 18080
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: {audience}
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - repository: {repo}
+                  repository_owner: {owner}
+          sinks:
+            e2e:
+              type: aws_s3
+              uri: s3://oidc-e2e/logs
+              region: us-east-1
+              use_path_style: true
+          logs:
+            summary:
+              sink: e2e
+            detection:
+              sink: e2e
+            runtime_event:
+              sink: e2e
+          """)
+          deny = textwrap.dedent(f"""\
+          bind:
+            address: 127.0.0.1
+            port: 18081
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: {audience}
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - repository: other-org/definitely-not-this-repo
+                  repository_owner: other-org
+          """)
+          # acme-corp vs acme-corp2 style: allowlist owner that must NOT match our repo owner if different;
+          # also prove startup reject for unknown keys / provider_host / slash owner.
+          bad_unknown = textwrap.dedent("""\
+          bind:
+            address: 127.0.0.1
+            port: 18082
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: http://127.0.0.1:18082
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - provider_host: github.com
+          """)
+          bad_slash = textwrap.dedent("""\
+          bind:
+            address: 127.0.0.1
+            port: 18083
+          auth:
+            oidc:
+              enabled: true
+              issuer: https://token.actions.githubusercontent.com
+              audience: http://127.0.0.1:18083
+              jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+              allow:
+                - repository_owner: acme/corp
+          """)
+          (out / "manager-allow.yaml").write_text(allow)
+          (out / "manager-deny.yaml").write_text(deny)
+          (out / "manager-bad-unknown.yaml").write_text(bad_unknown)
+          (out / "manager-bad-slash.yaml").write_text(bad_slash)
+          print(allow)
+          PY
+          echo "AUDIENCE=${AUDIENCE}" >> "$GITHUB_ENV"
+
+          # Startup rejects (config validation) — must fail before listen
+          set +e
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-full/manager-bad-unknown.yaml > /tmp/oidc-full/bad-unknown.log 2>&1
+          ec1=$?
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-full/manager-bad-slash.yaml > /tmp/oidc-full/manager-bad-slash.log 2>&1
+          ec2=$?
+          set -e
+          {
+            echo "exit_unknown=${ec1}"
+            echo "exit_slash=${ec2}"
+          } > /tmp/oidc-full/startup-rejects.env
+          if [ "$ec1" -eq 0 ] || [ "$ec2" -eq 0 ]; then
+            echo "expected Manager startup reject for bad allowlist configs" >&2
+            cat /tmp/oidc-full/bad-unknown.log /tmp/oidc-full/manager-bad-slash.log >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          open("/tmp/oidc-full/startup-rejects.json","w").write(json.dumps({
+            "ok": True,
+            "proven": ["reject unknown key / provider_host at startup", "reject repository_owner with slash at startup"],
+            "exit_unknown_key": int(open("/tmp/oidc-full/startup-rejects.env").read().split("exit_unknown=")[1].split()[0]),
+            "exit_slash_owner": int(open("/tmp/oidc-full/startup-rejects.env").read().split("exit_slash=")[1].split()[0]),
+          }, indent=2))
+          PY
+          echo "startup rejects ok (unknown key / slash owner)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Start colocated Managers (OIDC-only, real JWKS, split processes)
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-full/manager-allow.yaml \
+            > /tmp/oidc-full/manager-allow.log 2>&1 &
+          echo $! > /tmp/oidc-full/manager-allow.pid
+          ./bin/cicd-sensor-manager --config-file /tmp/oidc-full/manager-deny.yaml \
+            > /tmp/oidc-full/manager-deny.log 2>&1 &
+          echo $! > /tmp/oidc-full/manager-deny.pid
+          for i in $(seq 1 60); do
+            code_a=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)
+            code_b=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/ || true)
+            if [ "$code_a" = "401" ] && [ "$code_b" = "401" ]; then
+              echo "Managers up (401 probes)"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Managers failed to start" >&2
+          cat /tmp/oidc-full/manager-allow.log /tmp/oidc-full/manager-deny.log >&2
+          exit 1
+
+      - name: Long-job remint + IngestLog + rejects (WAIT ~6–10 min)
+        env:
+          MANAGER_URL: http://127.0.0.1:18080
+          MANAGER_DENY_URL: http://127.0.0.1:18081
+          MANAGER_AUDIENCE: ${{ env.AUDIENCE }}
+          E2E_MODE: full
+          E2E_SLEEP_SECONDS: "330"
+          E2E_INGEST: "1"
+          E2E_RESULTS_PATH: /tmp/oidc-full/long-remint-results.json
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          ./bin/oidc-manager-auth-e2e
+
+      - name: Agent/listener project start + result ForceRefresh (split client)
+        env:
+          MANAGER_URL: http://127.0.0.1:18080
+          MANAGER_AUDIENCE: ${{ env.AUDIENCE }}
+          E2E_SOCKET_DIR: /tmp/oidc-full/agent-path
+          E2E_RESULTS_PATH: /tmp/oidc-full/agent-path-results.json
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          set -euo pipefail
+          ./bin/oidc-agent-path-e2e
+
+      - name: Try real Agent binary (BPF may be physical blocker)
+        id: real_agent
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          SOCK=/tmp/oidc-full/real-agent.sock
+          rm -f "$SOCK"
+          # Attempt privileged start; GH-hosted may lack CAP_BPF.
+          set +e
+          sudo -E ./bin/cicd-sensor agent start \
+            --provider github --runner machine \
+            --socket "$SOCK" \
+            --id-token-request-url-hosts '*.actions.githubusercontent.com' \
+            > /tmp/oidc-full/real-agent.log 2>&1 &
+          echo $! > /tmp/oidc-full/real-agent.pid
+          set -e
+          ok=0
+          for i in $(seq 1 30); do
+            if [ -S "$SOCK" ]; then ok=1; break; fi
+            if ! kill -0 "$(cat /tmp/oidc-full/real-agent.pid)" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          python3 - <<PY
+          import json, pathlib
+          sock_ok = pathlib.Path("/tmp/oidc-full/real-agent.sock").exists()
+          log = pathlib.Path("/tmp/oidc-full/real-agent.log").read_text(errors="replace") if pathlib.Path("/tmp/oidc-full/real-agent.log").exists() else ""
+          out = {
+            "ok": sock_ok,
+            "socket_present": sock_ok,
+            "note": "Real Agent binary requires eBPF load. If blocked on GH-hosted ubuntu-latest, listener project-start path above is the proven prod control-socket path.",
+            "log_tail": log[-2000:],
+          }
+          pathlib.Path("/tmp/oidc-full/real-agent-attempt.json").write_text(json.dumps(out, indent=2))
+          print(json.dumps(out, indent=2))
+          PY
+          if [ ! -S "$SOCK" ]; then
+            echo "real Agent binary did not come up (likely BPF) — recorded; listener path remains primary evidence" >&2
+            exit 1
+          fi
+
+      - name: Verify S3 sink received ingest (if any)
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          aws --endpoint-url=http://127.0.0.1:4566 s3 ls s3://oidc-e2e/logs --recursive | tee /tmp/oidc-full/s3-listing.txt || true
+          if grep -q . /tmp/oidc-full/s3-listing.txt; then
+            echo '{"ok":true,"sink":"localstack_s3","objects_present":true}' > /tmp/oidc-full/sink-verify.json
+          else
+            echo '{"ok":false,"sink":"localstack_s3","objects_present":false,"note":"check ingest_log_oidc step / manager log"}' > /tmp/oidc-full/sink-verify.json
+          fi
+          cat /tmp/oidc-full/sink-verify.json
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Long remint + ingest + agent path'
+            echo
+            for f in long-remint-results.json agent-path-results.json real-agent-attempt.json sink-verify.json; do
+              echo "### $f"
+              echo '```json'
+              cat /tmp/oidc-full/$f 2>/dev/null || echo '{}'
+              echo '```'
+            done
+            echo '### Manager allow log (tail)'
+            echo '```'
+            tail -n 100 /tmp/oidc-full/manager-allow.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oidc-full-long-remint
+          path: /tmp/oidc-full/
+          if-no-files-found: warn
+
+      - name: Stop Managers / Agent
+        if: always()
+        run: |
+          for f in /tmp/oidc-full/manager-allow.pid /tmp/oidc-full/manager-deny.pid /tmp/oidc-full/real-agent.pid; do
+            [ -f "$f" ] && sudo kill "$(cat "$f")" 2>/dev/null || kill "$(cat "$f")" 2>/dev/null || true
+          done
+          docker rm -f oidc-localstack 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # Job 3: Measurement items 3 (root-ish) + 4 (post window) harder attempt
+  # ------------------------------------------------------------------
+  measure-3-root-and-4-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Item 3 — mint as uid 0 (sudo + privileged container)
+        id: item3
+        env:
+          MANAGER_AUDIENCE: https://cicd-sensor-manager.example.com
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-measure34
+          python3 - <<'PY'
+          import base64, json, os, subprocess, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+
+          def b64url_json(part):
+              pad = "=" * (-len(part) % 4)
+              return json.loads(base64.urlsafe_b64decode(part + pad))
+
+          def decode_jwt_times(raw):
+              parts = raw.split(".")
+              if len(parts) < 2:
+                  return None
+              claims = b64url_json(parts[1])
+              return {
+                  "iat": claims.get("iat"),
+                  "exp": claims.get("exp"),
+                  "lifetime_seconds": (claims.get("exp") or 0) - (claims.get("iat") or 0),
+                  "iss": claims.get("iss"),
+                  "aud": claims.get("aud"),
+              }
+
+          def mint(label, env=None):
+              env = env or os.environ
+              req_url = env.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+              req_tok = env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+              audience = env.get("MANAGER_AUDIENCE", "https://cicd-sensor-manager.example.com")
+              if not req_url or not req_tok:
+                  return {"ok": False, "label": label, "error": "missing ACTIONS_ID_TOKEN_REQUEST_*"}
+              parsed = urllib.parse.urlparse(req_url)
+              q = urllib.parse.parse_qs(parsed.query)
+              q["audience"] = [audience]
+              url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+              request = urllib.request.Request(url, method="GET", headers={
+                  "Authorization": f"bearer {req_tok}",
+                  "Accept": "application/json",
+              })
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as resp:
+                      body = json.load(resp)
+                      raw = body.get("value") or body.get("token") or ""
+                      return {"ok": True, "label": label, "http_status": getattr(resp, "status", 200), "id_token_times": decode_jwt_times(raw) if raw else None}
+              except Exception as e:
+                  return {"ok": False, "label": label, "error": str(e)}
+
+          out = {
+              "measured_at": datetime.now(timezone.utc).isoformat(),
+              "item": 3,
+              "job_uid": os.getuid(),
+              "job_euid": os.geteuid(),
+              "attempts": {},
+          }
+          out["attempts"]["job_user"] = mint("job_user")
+
+          # sudo -u root mint (env preserved)
+          script = r'''
+          import base64, json, os, urllib.parse, urllib.request
+          def b64url_json(part):
+              pad = "=" * (-len(part) % 4)
+              return json.loads(base64.urlsafe_b64decode(part + pad))
+          req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+          audience = os.environ.get("MANAGER_AUDIENCE", "https://cicd-sensor-manager.example.com")
+          parsed = urllib.parse.urlparse(req_url)
+          q = urllib.parse.parse_qs(parsed.query); q["audience"] = [audience]
+          url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+          req = urllib.request.Request(url, method="GET", headers={"Authorization": f"bearer {req_tok}", "Accept": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              body = json.load(resp)
+              raw = body.get("value") or ""
+              parts = raw.split(".")
+              claims = b64url_json(parts[1]) if len(parts) >= 2 else {}
+              print(json.dumps({"ok": True, "uid": os.getuid(), "euid": os.geteuid(), "http_status": getattr(resp, "status", 200),
+                                "id_token_times": {"iat": claims.get("iat"), "exp": claims.get("exp"),
+                                                   "lifetime_seconds": (claims.get("exp") or 0)-(claims.get("iat") or 0),
+                                                   "iss": claims.get("iss"), "aud": claims.get("aud")}}))
+          '''
+          try:
+              p = subprocess.run(
+                  ["sudo", "-E", "python3", "-c", script],
+                  capture_output=True, text=True, timeout=60, env=os.environ.copy(),
+              )
+              if p.returncode == 0 and p.stdout.strip():
+                  out["attempts"]["sudo_root"] = json.loads(p.stdout.strip().splitlines()[-1])
+              else:
+                  out["attempts"]["sudo_root"] = {"ok": False, "returncode": p.returncode, "stderr": p.stderr[-1000:], "stdout": p.stdout[-500:]}
+          except Exception as e:
+              out["attempts"]["sudo_root"] = {"ok": False, "error": str(e)}
+
+          # Privileged container with User root — pass request env via -e
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+          audience = os.environ.get("MANAGER_AUDIENCE", "https://cicd-sensor-manager.example.com")
+          docker_script = script  # same mint script
+          try:
+              p = subprocess.run(
+                  [
+                      "docker", "run", "--rm", "--privileged", "--user", "0:0",
+                      "-e", f"ACTIONS_ID_TOKEN_REQUEST_URL={req_url}",
+                      "-e", f"ACTIONS_ID_TOKEN_REQUEST_TOKEN={req_tok}",
+                      "-e", f"MANAGER_AUDIENCE={audience}",
+                      "python:3.12-slim", "python", "-c", docker_script,
+                  ],
+                  capture_output=True, text=True, timeout=120,
+              )
+              if p.returncode == 0 and p.stdout.strip():
+                  out["attempts"]["privileged_container_uid0"] = json.loads(p.stdout.strip().splitlines()[-1])
+              else:
+                  out["attempts"]["privileged_container_uid0"] = {
+                      "ok": False, "returncode": p.returncode,
+                      "stderr": p.stderr[-1500:], "stdout": p.stdout[-500:],
+                      "note": "Actions ID token env may not be reachable from container network path to token.actions host, or mint host blocks container source",
+                  }
+          except Exception as e:
+              out["attempts"]["privileged_container_uid0"] = {"ok": False, "error": str(e)}
+
+          # Closest-to-real summary
+          sudo_ok = bool(out["attempts"].get("sudo_root", {}).get("ok"))
+          ctr_ok = bool(out["attempts"].get("privileged_container_uid0", {}).get("ok"))
+          out["ok"] = sudo_ok or ctr_ok
+          out["systemd_unit"] = False
+          out["closest_result"] = (
+              "sudo_root mint succeeded (uid=0 process, not a real systemd User=root Agent unit)"
+              if sudo_ok else
+              "privileged_container_uid0 mint succeeded"
+              if ctr_ok else
+              "all root-ish mint attempts failed or blocked; true systemd User=root Agent unit still needs self-hosted runner"
+          )
+          path = "/tmp/oidc-measure34/item3.json"
+          open(path, "w").write(json.dumps(out, indent=2))
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Persist request env for post-job step
+        run: |
+          # Do NOT write request token to artifacts. Only prove post-window mint
+          # in a same-job post step below (still not true VM shutdown).
+          echo "item3 done"
+
+      - name: Item 4 approximation — mint in final step (post-ish window)
+        if: always()
+        env:
+          MANAGER_AUDIENCE: https://cicd-sensor-manager.example.com
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+          audience = os.environ.get("MANAGER_AUDIENCE", "https://cicd-sensor-manager.example.com")
+          result = {
+              "measured_at": datetime.now(timezone.utc).isoformat(),
+              "item": 4,
+              "window": "final_step_same_job_if_always_not_true_vm_shutdown",
+              "ok": False,
+          }
+          try:
+              parsed = urllib.parse.urlparse(req_url)
+              q = urllib.parse.parse_qs(parsed.query)
+              q["audience"] = [audience]
+              url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+              request = urllib.request.Request(url, method="GET", headers={
+                  "Authorization": f"bearer {req_tok}",
+                  "Accept": "application/json",
+              })
+              with urllib.request.urlopen(request, timeout=30) as resp:
+                  body = json.load(resp)
+                  result["ok"] = bool(body.get("value") or body.get("token"))
+                  result["http_status"] = getattr(resp, "status", 200)
+          except Exception as e:
+              result["error"] = str(e)
+          print(json.dumps(result, indent=2))
+          open("/tmp/oidc-measure34/item4-final-step.json", "w").write(json.dumps(result, indent=2))
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Measurement items 3/4 (harder attempt)'
+            echo '```json'
+            cat /tmp/oidc-measure34/item3.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo '```json'
+            cat /tmp/oidc-measure34/item4-final-step.json 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oidc-full-measure-3-4
+          path: /tmp/oidc-measure34/
+          if-no-files-found: warn
+
+  # Separate job after measure-3 completes — closer to "after job" window.
+  measure-4-separate-job:
+    runs-on: ubuntu-latest
+    needs: measure-3-root-and-4-post
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Post-job mint (separate job, still not VM teardown)
+        env:
+          MANAGER_AUDIENCE: https://cicd-sensor-manager.example.com
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/item4
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+          audience = os.environ.get("MANAGER_AUDIENCE", "https://cicd-sensor-manager.example.com")
+          result = {
+              "measured_at": datetime.now(timezone.utc).isoformat(),
+              "item": 4,
+              "window": "separate_job_after_measure3_not_vm_shutdown",
+              "ok": False,
+              "has_request_url": bool(req_url),
+              "has_request_token": bool(req_tok),
+          }
+          try:
+              if not req_url or not req_tok:
+                  raise RuntimeError("ACTIONS_ID_TOKEN_REQUEST_* missing in this job (expected: each job has its own)")
+              parsed = urllib.parse.urlparse(req_url)
+              q = urllib.parse.parse_qs(parsed.query)
+              q["audience"] = [audience]
+              url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+              request = urllib.request.Request(url, method="GET", headers={
+                  "Authorization": f"bearer {req_tok}",
+                  "Accept": "application/json",
+              })
+              with urllib.request.urlopen(request, timeout=30) as resp:
+                  body = json.load(resp)
+                  result["ok"] = bool(body.get("value") or body.get("token"))
+                  result["http_status"] = getattr(resp, "status", 200)
+          except Exception as e:
+              result["error"] = str(e)
+          print(json.dumps(result, indent=2))
+          open("/tmp/item4/item4-separate-job.json", "w").write(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oidc-full-measure-4-separate
+          path: /tmp/item4/
+          if-no-files-found: warn

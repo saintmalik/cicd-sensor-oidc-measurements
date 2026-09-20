@@ -50,7 +50,8 @@ jobs:
       - name: Build Manager + Agent CLI
         run: |
           set -euo pipefail
-          mkdir -p bin "$DEMO_ROOT" /tmp/oidc-user-demo
+          mkdir -p bin /tmp/oidc-user-demo
+          sudo mkdir -p "$DEMO_ROOT"
           go build -mod=vendor -o bin/cicd-sensor-manager ./cmd/cicd-sensor-manager
           go build -mod=vendor -o bin/cicd-sensor ./cmd/cicd-sensor
           sudo install -d -m 0755 /opt/cicd-sensor
@@ -196,7 +197,7 @@ jobs:
             sleep 1
           done
           systemctl is-active cicd-sensor-manager-oidc-lab.service
-          sudo journalctl -u cicd-sensor-manager-oidc-lab.service -n 30 --no-pager || true
+          sudo journalctl -u cicd-sensor-manager-oidc-lab.service -n 30 --no-pager -o cat 2>&1 | sed "s/vm-[a-z0-9-]*/lab-runner/gi" || true
 
       - name: Operator — start host Agent as systemd service
         run: |
@@ -223,18 +224,18 @@ jobs:
           for i in $(seq 1 40); do
             if [ -S "$AGENT_SOCKET" ]; then ok=1; break; fi
             if ! systemctl is-active --quiet cicd-sensor-agent-oidc-lab.service; then
-              sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 80 --no-pager || true
+              sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 80 --no-pager -o cat 2>&1 | sed "s/vm-[a-z0-9-]*/lab-runner/gi" || true
               break
             fi
             sleep 0.5
           done
           if [ "$ok" != 1 ]; then
             echo "Agent socket did not appear" >&2
-            sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 120 --no-pager || true
+            sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 120 --no-pager -o cat 2>&1 | sed "s/vm-[a-z0-9-]*/lab-runner/gi" || true
             exit 1
           fi
           echo "Agent socket ready: $AGENT_SOCKET"
-          sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 20 --no-pager || true
+          sudo journalctl -u cicd-sensor-agent-oidc-lab.service -n 20 --no-pager -o cat 2>&1 | sed "s/vm-[a-z0-9-]*/lab-runner/gi" || true
 
       - name: CI user — project start (manager-auth oidc)
         id: project_start
@@ -292,7 +293,7 @@ jobs:
           mc ls --recursive oidclab/oidc-user-demo/ | tee /tmp/oidc-user-demo/sink-ls.txt || true
           count=$(mc ls --recursive oidclab/oidc-user-demo/ 2>/dev/null | wc -l | tr -d ' ')
           echo "sink_object_count=${count}" >> "$GITHUB_OUTPUT"
-          python3 - <<PY
+          python3 <<PY
           import json, pathlib
           count = int("${count}" or "0")
           out = {

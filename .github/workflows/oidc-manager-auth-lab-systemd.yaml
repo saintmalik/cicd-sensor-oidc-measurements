@@ -57,21 +57,21 @@ jobs:
           sudo systemctl start cicd-sensor-oidc-mint.service
           rc=$?
           set -e
-          sudo systemctl status cicd-sensor-oidc-mint.service --no-pager -l || true
-          journalctl -u cicd-sensor-oidc-mint.service -n 40 --no-pager || true
+          sudo systemctl status cicd-sensor-oidc-mint.service --no-pager -l 2>&1 | sed 's/vm-[a-z0-9-]*/lab-runner/gi' || true
+          # Avoid leaking hostnames from journal into shareable Actions logs
+          journalctl -u cicd-sensor-oidc-mint.service -n 20 --no-pager -o cat 2>&1 | sed 's/vm-[a-z0-9-]*/lab-runner/gi' || true
           if [ ! -f /var/lib/cicd-sensor-oidc-measure/last-mint.json ]; then
             echo "missing last-mint.json" >&2
             exit 1
           fi
-          sudo cp /var/lib/cicd-sensor-oidc-measure/last-mint.json /tmp/oidc-lab-measure/item3-systemd-root.json
-          sudo chmod 0644 /tmp/oidc-lab-measure/item3-systemd-root.json
-          python3 - <<'PY'
+          sudo cat /var/lib/cicd-sensor-oidc-measure/last-mint.json > /tmp/oidc-lab-measure/item3-systemd-root.json
+          python3 <<'PY'
           import json, sys
-          d = json.load(open("/tmp/oidc-lab-measure/item3-systemd-root.json"))
+          path = "/tmp/oidc-lab-measure/item3-systemd-root.json"
+          d = json.load(open(path))
           # Drop any accidental infra identifiers from shareable artifact
-          if d.get("host") not in (None, "lab-runner"):
-              d["host"] = "lab-runner"
-          open("/tmp/oidc-lab-measure/item3-systemd-root.json", "w").write(json.dumps(d, indent=2) + "\n")
+          d["host"] = "lab-runner"
+          open(path, "w").write(json.dumps(d, indent=2) + "\n")
           print(json.dumps(d, indent=2))
           ok = (
               d.get("ok") is True
@@ -91,7 +91,7 @@ jobs:
       - name: Job-user mint baseline (control)
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 <<'PY'
           import base64, json, os, time, urllib.parse, urllib.request
           from datetime import datetime, timezone
           def b64url_json(part):
@@ -174,7 +174,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/oidc-lab-measure4
-          # Hook should have run after previous job; give it a moment if racing
           for i in 1 2 3 4 5 6; do
             if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then
               break
@@ -182,21 +181,12 @@ jobs:
             sleep 1
           done
           if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then
-            sudo cp /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json /tmp/oidc-lab-measure4/
-            sudo chmod 0644 /tmp/oidc-lab-measure4/item4-job-completed.json
-            python3 - <<'PY'
-            import json
-            p = "/tmp/oidc-lab-measure4/item4-job-completed.json"
-            d = json.load(open(p))
-            if d.get("host") not in (None, "lab-runner"):
-                d["host"] = "lab-runner"
-            open(p, "w").write(json.dumps(d, indent=2) + "\n")
-            PY
+            sudo cat /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json > /tmp/oidc-lab-measure4/item4-job-completed.json
+            python3 -c 'import json; p="/tmp/oidc-lab-measure4/item4-job-completed.json"; d=json.load(open(p)); d["host"]="lab-runner"; open(p,"w").write(json.dumps(d,indent=2)+"\n")'
           else
             echo '{"ok":false,"item":4,"error":"hook result missing on runner"}' > /tmp/oidc-lab-measure4/item4-job-completed.json
           fi
-          # Also try a direct post-job mint from this follow-up job as secondary signal
-          python3 - <<'PY'
+          python3 <<'PY'
           import base64, json, os, time, urllib.parse, urllib.request
           from datetime import datetime, timezone
           def b64url_json(part):

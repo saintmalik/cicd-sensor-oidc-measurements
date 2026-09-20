@@ -157,7 +157,7 @@ jobs:
               sink: lab-s3
           """)
           pathlib.Path("/tmp/oidc-user-demo/manager.yaml").write_text(cfg)
-          pathlib.Path("/tmp/oidc-user-demo/rules.yaml").write_text("rules: []\n")
+          pathlib.Path("/tmp/oidc-user-demo/rules.yaml").write_text("rule_sets: []\n")
           print(cfg)
           PY
           sudo install -m 0644 /tmp/oidc-user-demo/manager.yaml /etc/cicd-sensor/manager-oidc-user-demo.yaml

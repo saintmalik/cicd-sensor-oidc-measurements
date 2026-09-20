@@ -38,6 +38,9 @@ jobs:
             echo "OIDC_MEASURE_LABEL=systemd_root_oneshot"
           } | sudo tee /run/cicd-sensor-oidc-measure/job.env >/dev/null
           sudo chmod 0600 /run/cicd-sensor-oidc-measure/job.env
+          # Persist a copy for JOB_COMPLETED hook (runs after job; /run may be inaccessible to runner user)
+          sudo cp /run/cicd-sensor-oidc-measure/job.env /var/lib/cicd-sensor-oidc-measure/job.env
+          sudo chmod 0600 /var/lib/cicd-sensor-oidc-measure/job.env
           echo "job.env written (secrets redacted)"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"

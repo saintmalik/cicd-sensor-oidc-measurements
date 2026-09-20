@@ -1,0 +1,261 @@
+# Measurement item 3 (true systemd User=root) + item 4 best-effort JOB_COMPLETED
+# on lab self-hosted runner VM.
+#
+# Requires online runner labeled lab / oidc-measure.
+# Do not invent numbers — paste JSON from artifacts into the design table.
+
+name: OIDC Manager Auth lab systemd
+
+on:
+  workflow_dispatch:
+    inputs:
+      manager_audience:
+        description: "OIDC audience used for mint GETs (Manager origin)"
+        required: false
+        default: "https://cicd-sensor-manager.example.com"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  measure-3-systemd-root:
+    runs-on: [self-hosted, lab, oidc-measure]
+    timeout-minutes: 15
+    steps:
+      - name: Persist OIDC request creds for root oneshot + JOB_COMPLETED hook
+        env:
+          MANAGER_AUDIENCE: ${{ inputs.manager_audience }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /run/cicd-sensor-oidc-measure /var/lib/cicd-sensor-oidc-measure
+          sudo chmod 0700 /run/cicd-sensor-oidc-measure
+          # Write env without echoing secrets
+          {
+            echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL}"
+            echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+            echo "MANAGER_AUDIENCE=${MANAGER_AUDIENCE}"
+            echo "OIDC_MEASURE_LABEL=systemd_root_oneshot"
+          } | sudo tee /run/cicd-sensor-oidc-measure/job.env >/dev/null
+          sudo chmod 0600 /run/cicd-sensor-oidc-measure/job.env
+          echo "job.env written (secrets redacted)"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+      - name: Item 3 — mint via systemd User=root oneshot
+        id: item3
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-lab
+          sudo systemctl reset-failed cicd-sensor-oidc-mint.service 2>/dev/null || true
+          # Ensure unit is known
+          systemctl cat cicd-sensor-oidc-mint.service >/dev/null
+          set +e
+          sudo systemctl start cicd-sensor-oidc-mint.service
+          rc=$?
+          set -e
+          sudo systemctl status cicd-sensor-oidc-mint.service --no-pager -l || true
+          journalctl -u cicd-sensor-oidc-mint.service -n 40 --no-pager || true
+          if [ ! -f /var/lib/cicd-sensor-oidc-measure/last-mint.json ]; then
+            echo "missing last-mint.json" >&2
+            exit 1
+          fi
+          sudo cp /var/lib/cicd-sensor-oidc-measure/last-mint.json /tmp/oidc-lab/item3-systemd-root.json
+          sudo chmod 0644 /tmp/oidc-lab/item3-systemd-root.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("/tmp/oidc-lab/item3-systemd-root.json"))
+          print(json.dumps(d, indent=2))
+          ok = (
+              d.get("ok") is True
+              and d.get("uid") == 0
+              and d.get("euid") == 0
+              and d.get("systemd_unit") is True
+              and (d.get("mint") or {}).get("http_status") == 200
+              and (d.get("mint") or {}).get("ok") is True
+          )
+          if not ok:
+              print("PROOF_FAILED", file=sys.stderr)
+              sys.exit(1)
+          print("PROOF_OK uid=0 systemd_unit=true http=200")
+          PY
+          test "$rc" -eq 0
+
+      - name: Job-user mint baseline (control)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, time, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+          def b64url_json(part):
+              pad = "=" * (-len(part) % 4)
+              return json.loads(base64.urlsafe_b64decode(part + pad))
+          def decode_jwt_times(raw):
+              parts = raw.split(".")
+              claims = b64url_json(parts[1])
+              return {
+                  "iat": claims.get("iat"),
+                  "exp": claims.get("exp"),
+                  "lifetime_seconds": (claims.get("exp") or 0) - (claims.get("iat") or 0),
+                  "iss": claims.get("iss"),
+                  "aud": claims.get("aud"),
+              }
+          req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+          audience = os.environ.get("MANAGER_AUDIENCE") or "https://cicd-sensor-manager.example.com"
+          parsed = urllib.parse.urlparse(req_url)
+          q = urllib.parse.parse_qs(parsed.query)
+          q["audience"] = [audience]
+          url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+          request = urllib.request.Request(url, method="GET", headers={
+              "Authorization": f"bearer {req_tok}",
+              "Accept": "application/json",
+          })
+          with urllib.request.urlopen(request, timeout=30) as resp:
+              body = json.load(resp)
+              raw = body.get("value") or body.get("token") or ""
+              out = {
+                  "measured_at": datetime.now(timezone.utc).isoformat(),
+                  "item": "baseline_job_user",
+                  "uid": os.getuid(),
+                  "euid": os.geteuid(),
+                  "http_status": getattr(resp, "status", 200),
+                  "ok": True,
+                  "id_token_times": decode_jwt_times(raw) if raw else None,
+              }
+          open("/tmp/oidc-lab/baseline-job-user.json","w").write(json.dumps(out, indent=2)+"\n")
+          print(json.dumps(out, indent=2))
+          PY
+        env:
+          MANAGER_AUDIENCE: ${{ inputs.manager_audience }}
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo '## lab systemd OIDC mint'
+            echo
+            echo '### Item 3 (systemd User=root oneshot)'
+            echo '```json'
+            cat /tmp/oidc-lab/item3-systemd-root.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo
+            echo '### Baseline job user'
+            echo '```json'
+            cat /tmp/oidc-lab/baseline-job-user.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo
+            echo 'Item 4 JOB_COMPLETED hook result is collected in the follow-up job (post-hook file on the runner).'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload item3 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-lab-item3-systemd
+          path: /tmp/oidc-lab/
+          if-no-files-found: warn
+
+  # Collect JOB_COMPLETED hook output after the measure job finishes.
+  measure-4-job-completed:
+    runs-on: [self-hosted, lab, oidc-measure]
+    needs: measure-3-systemd-root
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Collect item4 JOB_COMPLETED hook result
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-lab4
+          # Hook should have run after previous job; give it a moment if racing
+          for i in 1 2 3 4 5 6; do
+            if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then
+            sudo cp /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json /tmp/oidc-lab4/
+            sudo chmod 0644 /tmp/oidc-lab4/item4-job-completed.json
+          else
+            echo '{"ok":false,"item":4,"error":"hook result missing on runner"}' > /tmp/oidc-lab4/item4-job-completed.json
+          fi
+          # Also try a direct post-job mint from this follow-up job as secondary signal
+          python3 - <<'PY'
+          import base64, json, os, time, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+          def b64url_json(part):
+              pad = "=" * (-len(part) % 4)
+              return json.loads(base64.urlsafe_b64decode(part + pad))
+          def decode_jwt_times(raw):
+              parts = raw.split(".")
+              claims = b64url_json(parts[1])
+              return {
+                  "iat": claims.get("iat"),
+                  "exp": claims.get("exp"),
+                  "lifetime_seconds": (claims.get("exp") or 0) - (claims.get("iat") or 0),
+                  "iss": claims.get("iss"),
+                  "aud": claims.get("aud"),
+              }
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+          audience = "https://cicd-sensor-manager.example.com"
+          out = {
+              "measured_at": datetime.now(timezone.utc).isoformat(),
+              "item": 4,
+              "kind": "followup_job_mint",
+              "note": "Separate job on same self-hosted host after measure job; not true VM teardown",
+              "ok": False,
+          }
+          if not req_url or not req_tok:
+              out["error"] = "missing request creds in follow-up job"
+          else:
+              parsed = urllib.parse.urlparse(req_url)
+              q = urllib.parse.parse_qs(parsed.query)
+              q["audience"] = [audience]
+              url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode({k: v[0] for k, v in q.items()})))
+              request = urllib.request.Request(url, method="GET", headers={
+                  "Authorization": f"bearer {req_tok}",
+                  "Accept": "application/json",
+              })
+              started = time.time()
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as resp:
+                      body = json.load(resp)
+                      raw = body.get("value") or body.get("token") or ""
+                      out.update({
+                          "ok": True,
+                          "http_status": getattr(resp, "status", 200),
+                          "elapsed_ms": int((time.time()-started)*1000),
+                          "id_token_times": decode_jwt_times(raw) if raw else None,
+                      })
+              except Exception as e:
+                  out["error"] = str(e)
+                  if hasattr(e, "code"):
+                      out["http_status"] = e.code
+          open("/tmp/oidc-lab4/item4-followup-job.json","w").write(json.dumps(out, indent=2)+"\n")
+          print(json.dumps(out, indent=2))
+          hook = {}
+          try:
+              hook = json.load(open("/tmp/oidc-lab4/item4-job-completed.json"))
+          except Exception:
+              pass
+          print("HOOK:", json.dumps(hook, indent=2))
+          PY
+          {
+            echo '## Item 4 (JOB_COMPLETED + follow-up)'
+            echo '```json'
+            cat /tmp/oidc-lab4/item4-job-completed.json
+            echo '```'
+            echo '```json'
+            cat /tmp/oidc-lab4/item4-followup-job.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload item4 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-lab-item4-hooks
+          path: /tmp/oidc-lab4/
+          if-no-files-found: warn

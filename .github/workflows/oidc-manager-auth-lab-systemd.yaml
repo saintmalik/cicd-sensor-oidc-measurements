@@ -49,6 +49,7 @@ jobs:
         id: item3
         run: |
           set -euo pipefail
+          sudo rm -rf /tmp/oidc-lab-measure
           mkdir -p /tmp/oidc-lab-measure
           sudo systemctl reset-failed cicd-sensor-oidc-mint.service 2>/dev/null || true
           # Ensure unit is known
@@ -173,6 +174,7 @@ jobs:
       - name: Collect item4 JOB_COMPLETED hook result
         run: |
           set -euo pipefail
+          sudo rm -rf /tmp/oidc-lab-measure4
           mkdir -p /tmp/oidc-lab-measure4
           for i in 1 2 3 4 5 6; do
             if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then

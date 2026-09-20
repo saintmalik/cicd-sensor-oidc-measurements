@@ -285,9 +285,23 @@ jobs:
         id: project_result
         run: |
           set -euo pipefail
+          # project result does not yet apply GITHUB_* env fallbacks; pass identity explicitly.
+          HOST="$(python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          u = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+          print((urlparse(u).hostname or "github.com").lower())
+          PY
+          )"
           /opt/cicd-sensor/cicd-sensor project result \
             --socket "$AGENT_SOCKET" \
             --provider github \
+            --provider-host "$HOST" \
+            --project-path "${GITHUB_REPOSITORY}" \
+            --github-run-id "${GITHUB_RUN_ID}" \
+            --github-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --github-job "${GITHUB_JOB}" \
+            --github-runner-tracking-id "${RUNNER_TRACKING_ID}" \
             | tee /tmp/oidc-user-demo/project-result.txt
           echo "project_result_ok=true" >> "$GITHUB_OUTPUT"
 

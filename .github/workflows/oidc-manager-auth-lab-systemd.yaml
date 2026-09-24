@@ -4,7 +4,7 @@
 # Requires online runner labeled oidc-lab.
 # Do not invent numbers — paste JSON from artifacts into the design table.
 
-name: OIDC Manager Auth Lab Systemd
+name: OIDC Lab Systemd Root Mint
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 jobs:
-  measure-3-systemd-root:
+  systemd-root-mint:
     runs-on: [self-hosted, oidc-lab]
     timeout-minutes: 15
     steps:
@@ -164,10 +164,10 @@ jobs:
           path: /tmp/oidc-lab-measure/
           if-no-files-found: warn
 
-  # Collect JOB_COMPLETED hook output after the measure job finishes.
-  measure-4-job-completed:
+  # Collect JOB_COMPLETED hook output after the mint job finishes.
+  job-completed-hook:
     runs-on: [self-hosted, oidc-lab]
-    needs: measure-3-systemd-root
+    needs: systemd-root-mint
     if: always()
     timeout-minutes: 10
     steps:

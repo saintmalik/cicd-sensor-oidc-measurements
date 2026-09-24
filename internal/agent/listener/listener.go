@@ -38,16 +38,16 @@ const (
 
 // Listener serves the control socket API over a unix domain socket.
 type Listener struct {
-	logger                   *slog.Logger
-	jobRegistry              *jobregistry.JobRegistry
-	socketPath               string
-	hostManagerConn          managerclient.Connection
-	hostManagerClient        jobregistry.ManagerConfigFetcher
-	runnerType               string
-	provider                 jobcontext.Provider
-	idTokenRequestURLHosts   []string
-	idTokenHTTPClient        *http.Client
-	server                   *http.Server
+	logger                 *slog.Logger
+	jobRegistry            *jobregistry.JobRegistry
+	socketPath             string
+	hostManagerConn        managerclient.Connection
+	hostManagerClient      jobregistry.ManagerConfigFetcher
+	runnerType             string
+	provider               jobcontext.Provider
+	idTokenRequestURLHosts []string
+	idTokenHTTPClient      *http.Client
+	server                 *http.Server
 }
 
 // Config is the process-wide listener configuration. Project manager inputs

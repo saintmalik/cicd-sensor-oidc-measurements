@@ -93,9 +93,9 @@ func (p authPrincipal) isOIDC() bool {
 }
 
 type authMiddlewareOptions struct {
-	tokens   *TokenStore
-	oidc     *oidcauth.Verifier
-	oidcOn   bool
+	tokens *TokenStore
+	oidc   *oidcauth.Verifier
+	oidcOn bool
 }
 
 // newAuthMiddleware enforces manager auth before Connect decodes the request.

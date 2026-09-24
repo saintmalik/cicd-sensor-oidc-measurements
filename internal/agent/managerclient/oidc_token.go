@@ -21,7 +21,7 @@ const (
 	DefaultIDTokenEarlyExpiry = 60 * time.Second
 
 	// TokenTypeHeader declares which credential kind Authorization carries.
-	TokenTypeHeader = "Cicd-Sensor-Token-Type"
+	TokenTypeHeader       = "Cicd-Sensor-Token-Type"
 	TokenTypeManagerToken = "manager-token"
 	TokenTypeIDToken      = "id-token"
 )

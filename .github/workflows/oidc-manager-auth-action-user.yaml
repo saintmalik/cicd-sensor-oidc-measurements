@@ -1,22 +1,21 @@
 # Normal-user Action path for Manager OIDC auth.
 #
-# Honest pin: upstream cicd-sensor/cicd-sensor-action@v0.0.38 has manager-token
-# only. This workflow uses saintmalik/cicd-sensor-action@<sha> (fork) which adds
-# manager-auth: oidc until upstream merges. Agent/Manager binaries come from the
-# preview release saintmalik/cicd-sensor releases/v0.0.99 (OIDC branch).
+# Product under test:
+#   - saintmalik/cicd-sensor-action@<sha> with manager-auth: oidc
+#   - saintmalik/cicd-sensor Agent/Manager preview release (releases/v0.0.99)
 #
-# Topology: colocated Manager in the same job (operator), then the CI-user steps
-# are only the Action + real work — no Go e2e harness / giant bash user-demo.
+# Topology: colocated Manager in the same job (operator setup), then CI-user
+# steps are only the Action + real work (including optional long remint).
 
-name: OIDC Manager Auth Action User Path
+name: OIDC Action User Path
 
 on:
   workflow_dispatch:
     inputs:
       remint_sleep_seconds:
-        description: "Optional mid-job sleep so ID token can expire (0 skips)"
+        description: "Mid-job sleep so ID token can expire before project result (default 330)"
         required: false
-        default: "0"
+        default: "330"
 
 permissions:
   id-token: write
@@ -24,14 +23,13 @@ permissions:
 
 env:
   MANAGER_URL: http://127.0.0.1:18080
-  # saintmalik/cicd-sensor-action@feat/manager-auth-oidc
-  # v0.0.0-oidc.1 — pin SHA until upstream merges manager-auth: oidc
+  # saintmalik/cicd-sensor-action@feat/manager-auth-oidc — v0.0.0-oidc.1
   ACTION_REF: e1d4fb3fa3a514ef151dcccfbd0c0f4c28509e7c
 
 jobs:
   user-path:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Operator — download OIDC Manager binary
         run: |
@@ -91,7 +89,6 @@ jobs:
               echo "Manager log shows activity"
               break
             fi
-            # Process alive is enough; Connect may not answer HTTP GET /
             if kill -0 "$(cat /tmp/oidc-action-user/manager.pid)" 2>/dev/null; then
               if [ "$i" -ge 8 ]; then
                 echo "Manager process up"
@@ -115,16 +112,18 @@ jobs:
           enable-attestation-artifact: "false"
           enable-debug: "true"
 
-      - name: User — real work
+      - name: User — real work (incl. remint window)
         env:
           SLEEP_S: ${{ inputs.remint_sleep_seconds }}
         run: |
           set -euo pipefail
           echo "hello from normal CI user work"
           uname -a
-          if [ "${SLEEP_S}" != "0" ] && [ -n "${SLEEP_S}" ]; then
-            echo "sleeping ${SLEEP_S}s for optional remint window"
+          if [ -n "${SLEEP_S}" ] && [ "${SLEEP_S}" != "0" ]; then
+            echo "sleeping ${SLEEP_S}s for remint window"
             sleep "${SLEEP_S}"
+          else
+            echo "remint sleep skipped"
           fi
           echo "work done"
 
@@ -132,11 +131,12 @@ jobs:
         if: always()
         run: |
           {
-            echo '## OIDC Manager Auth Action User Path'
+            echo '## OIDC Action User Path'
             echo
-            echo '- Action pin: `saintmalik/cicd-sensor-action@e1d4fb3fa3a514ef151dcccfbd0c0f4c28509e7c` (fork; upstream has no manager-auth yet)'
-            echo '- Agent/Manager: `saintmalik/cicd-sensor` `releases/v0.0.99` (OIDC preview)'
-            echo '- User steps: Action `manager-auth: oidc` + real work (no Go harness)'
+            echo '- Action pin: `saintmalik/cicd-sensor-action@e1d4fb3fa3a514ef151dcccfbd0c0f4c28509e7c` (v0.0.0-oidc.1)'
+            echo '- Agent/Manager: `saintmalik/cicd-sensor` `releases/v0.0.99`'
+            echo '- manager-auth: oidc'
+            echo "- remint_sleep_seconds: ${{ inputs.remint_sleep_seconds }}"
             echo
             echo '### Manager log (tail)'
             echo '```'

@@ -1,14 +1,13 @@
 # Manual workflow: measure GitHub Actions OIDC mint behavior for Manager auth.
 #
-# @rung Measurement items 1–5 from oidc-manager-auth design.
-# Run: Actions → "OIDC Manager Auth Measurements" → Run workflow
+# Run: Actions → "OIDC Manager Auth Mint Timing" → Run workflow
 #
 # This workflow does NOT invent numbers. It prints JSON results to the job
-# summary and uploads an artifact. Paste Results into the design doc table.
+# summary and uploads an artifact. Paste results into the design doc table.
 #
 # Required: permissions.id-token: write (this workflow sets it).
 
-name: OIDC Manager Auth Measurements
+name: OIDC Manager Auth Mint Timing
 
 on:
   workflow_dispatch:
@@ -175,7 +174,7 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/oidc-measure/results.json ]; then
-            echo '## OIDC Manager Auth Measurements' >> "$GITHUB_STEP_SUMMARY"
+            echo '## OIDC Manager Auth Mint Timing' >> "$GITHUB_STEP_SUMMARY"
             echo '```json' >> "$GITHUB_STEP_SUMMARY"
             cat /tmp/oidc-measure/results.json >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"

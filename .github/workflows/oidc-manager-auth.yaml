@@ -28,7 +28,6 @@ jobs:
     env:
       MANAGER_URL: http://127.0.0.1:18080
     steps:
-      # --- Lab operator: colocated Manager (not the product UX) ---
       - name: Download Manager binary
         run: |
           set -euo pipefail
@@ -79,7 +78,6 @@ jobs:
           done
           kill -0 "$(cat /tmp/oidc-lab/manager.pid)"
 
-      # --- Normal CI user ---
       - name: cicd-sensor Action
         uses: saintmalik/cicd-sensor-action@e1d4fb3fa3a514ef151dcccfbd0c0f4c28509e7c # v0.0.0-oidc.1
         with:

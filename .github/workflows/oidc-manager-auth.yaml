@@ -1,11 +1,13 @@
-# OIDC Manager Auth — normal CI-user path via the Action.
+# OIDC Manager Auth — Action user path + mint probes (one run URL).
 #
-# Product under test:
+# Product under test (action-user):
 #   - saintmalik/cicd-sensor-action@<full-sha> # v0.0.0-oidc.1 (manager-auth: oidc)
 #   - saintmalik/cicd-sensor Agent/Manager preview release (releases/v0.0.99)
 #
-# Lab only: start a colocated Manager in-job, then use the Action like any
-# customer would. Run: Actions → "OIDC Manager Auth" → Run workflow
+# mint-probes: request-token lifetime, remint after sleep, request-URL host.
+# lab-root-mint: optional self-hosted systemd User=root mint (continue-on-error).
+#
+# Run: Actions → "OIDC Manager Auth" → Run workflow
 
 name: OIDC Manager Auth
 
@@ -16,6 +18,15 @@ on:
         description: "Mid-job sleep so the Agent can remint after ID token expiry (default 330; 0 skips)"
         required: false
         default: "330"
+      mint_sleep_seconds:
+        description: "mint-probes sleep before remint (default 300; 0 skips remint)"
+        required: false
+        default: "300"
+      run_lab_root_mint:
+        description: "Also run lab-root-mint on self-hosted oidc-lab"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   id-token: write
@@ -117,3 +128,146 @@ jobs:
           if [ -f /tmp/oidc-lab/manager.pid ]; then
             kill "$(cat /tmp/oidc-lab/manager.pid)" 2>/dev/null || true
           fi
+
+  mint-probes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run mint probes
+        env:
+          SLEEP_SECONDS: ${{ inputs.mint_sleep_seconds }}
+          MANAGER_AUDIENCE: https://cicd-sensor-manager.example.com
+          OUT_PATH: /tmp/oidc-mint-probes/results.json
+        run: python3 scripts/mint-probes.py
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f /tmp/oidc-mint-probes/results.json ]; then
+            {
+              echo '## Mint probes'
+              echo '```json'
+              cat /tmp/oidc-mint-probes/results.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload mint-probes artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-mint-probes
+          path: /tmp/oidc-mint-probes/results.json
+          if-no-files-found: warn
+
+  lab-root-mint:
+    runs-on: [self-hosted, oidc-lab]
+    continue-on-error: true
+    if: ${{ inputs.run_lab_root_mint }}
+    timeout-minutes: 15
+    steps:
+      - name: Persist OIDC request creds for root oneshot
+        env:
+          MANAGER_AUDIENCE: https://cicd-sensor-manager.example.com
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /run/cicd-sensor-oidc-measure /var/lib/cicd-sensor-oidc-measure
+          sudo chmod 0700 /run/cicd-sensor-oidc-measure
+          sudo rm -f /var/lib/cicd-sensor-oidc-measure/last-mint.json \
+            /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json
+          {
+            echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL}"
+            echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+            echo "MANAGER_AUDIENCE=${MANAGER_AUDIENCE}"
+            echo "OIDC_MEASURE_LABEL=systemd_root_oneshot"
+          } | sudo tee /run/cicd-sensor-oidc-measure/job.env >/dev/null
+          sudo chmod 0600 /run/cicd-sensor-oidc-measure/job.env
+          sudo cp /run/cicd-sensor-oidc-measure/job.env /var/lib/cicd-sensor-oidc-measure/job.env
+          sudo chmod 0600 /var/lib/cicd-sensor-oidc-measure/job.env
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+      - name: Mint via systemd User=root oneshot
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-lab-mint
+          sudo systemctl reset-failed cicd-sensor-oidc-mint.service 2>/dev/null || true
+          systemctl cat cicd-sensor-oidc-mint.service >/dev/null
+          sudo systemctl start cicd-sensor-oidc-mint.service
+          test -f /var/lib/cicd-sensor-oidc-measure/last-mint.json
+          sudo cat /var/lib/cicd-sensor-oidc-measure/last-mint.json > /tmp/oidc-lab-mint/root-mint.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("/tmp/oidc-lab-mint/root-mint.json"))
+          d["host"] = "lab-runner"
+          open("/tmp/oidc-lab-mint/root-mint.json", "w").write(json.dumps(d, indent=2) + "\n")
+          print(json.dumps(d, indent=2))
+          ok = (
+              d.get("ok") is True
+              and d.get("uid") == 0
+              and d.get("euid") == 0
+              and d.get("systemd_unit") is True
+              and (d.get("mint") or {}).get("http_status") == 200
+          )
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Lab root mint'
+            echo '```json'
+            cat /tmp/oidc-lab-mint/root-mint.json 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lab-root-mint artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-lab-root-mint
+          path: /tmp/oidc-lab-mint/
+          if-no-files-found: warn
+
+  # Collect JOB_COMPLETED hook after lab-root-mint finishes (same host; not GH-hosted VM teardown).
+  lab-post-job:
+    runs-on: [self-hosted, oidc-lab]
+    needs: lab-root-mint
+    if: ${{ always() && inputs.run_lab_root_mint }}
+    continue-on-error: true
+    timeout-minutes: 5
+    steps:
+      - name: Collect JOB_COMPLETED hook result
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oidc-lab-post
+          for i in 1 2 3 4 5 6; do
+            [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ] && break
+            sleep 1
+          done
+          if [ -f /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json ]; then
+            sudo cat /var/lib/cicd-sensor-oidc-measure/item4-job-completed.json \
+              > /tmp/oidc-lab-post/job-completed-hook.json
+            python3 -c 'import json; p="/tmp/oidc-lab-post/job-completed-hook.json"; d=json.load(open(p)); d["host"]="lab-runner"; open(p,"w").write(json.dumps(d,indent=2)+"\n")'
+          else
+            echo '{"ok":false,"note":"JOB_COMPLETED hook result not present on runner"}' \
+              > /tmp/oidc-lab-post/job-completed-hook.json
+          fi
+          {
+            echo '## Lab post-job hook'
+            echo '```json'
+            cat /tmp/oidc-lab-post/job-completed-hook.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lab-post-job artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-lab-post-job
+          path: /tmp/oidc-lab-post/
+          if-no-files-found: warn

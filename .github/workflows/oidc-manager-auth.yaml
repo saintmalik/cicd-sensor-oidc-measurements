@@ -1,10 +1,11 @@
 # OIDC Manager Auth — normal CI-user path via the Action.
 #
-# Lab only: start a colocated Manager in-job, then use the Action like any
-# customer would. Upstream cicd-sensor/cicd-sensor-action still lacks
-# manager-auth: oidc, so we pin the fork SHA + version comment.
+# Product under test:
+#   - saintmalik/cicd-sensor-action@<full-sha> # v0.0.0-oidc.1 (manager-auth: oidc)
+#   - saintmalik/cicd-sensor Agent/Manager preview release (releases/v0.0.99)
 #
-# Run: Actions → "OIDC Manager Auth" → Run workflow
+# Lab only: start a colocated Manager in-job, then use the Action like any
+# customer would. Run: Actions → "OIDC Manager Auth" → Run workflow
 
 name: OIDC Manager Auth
 
@@ -12,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       remint_sleep_seconds:
-        description: "Optional mid-job sleep so the Agent can remint after ID token expiry (0 skips)"
+        description: "Mid-job sleep so the Agent can remint after ID token expiry (default 330; 0 skips)"
         required: false
-        default: "0"
+        default: "330"
 
 permissions:
   id-token: write

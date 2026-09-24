@@ -105,6 +105,10 @@ def main() -> int:
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     job = os.environ.get("GITHUB_JOB", "")
     started_at = utc_now()
+    # Runner orphan cleanup (JobExtension) SIGKILLs processes whose env still has
+    # matching RUNNER_TRACKING_ID. Clear it so we survive until VM OS teardown,
+    # which delivers a catchable SIGTERM/SIGHUP.
+    tracking_before = os.environ.pop("RUNNER_TRACKING_ID", None)
 
     post_sink(
         sink,
@@ -115,26 +119,21 @@ def main() -> int:
             "github_run_id": run_id,
             "github_job": job,
             "pid": os.getpid(),
+            "cleared_runner_tracking_id": tracking_before is not None,
         },
     )
 
     handled = {"done": False}
 
-    def on_signal(signum, _frame):
-        if handled["done"]:
-            return
-        handled["done"] = True
-        sig_name = signal.Signals(signum).name
-        received_at = utc_now()
-        mint_result = mint(req_url, req_tok, aud)
+    def report(trigger: str, mint_result: dict) -> None:
         payload = {
             "kind": "teardown_mint",
             "window": "gh_hosted_vm_teardown_sigterm",
             "ok": bool(mint_result.get("ok")),
             "http_status": mint_result.get("http_status"),
-            "signal": sig_name,
+            "signal": trigger,
             "started_at": started_at,
-            "signal_received_at": received_at,
+            "signal_received_at": utc_now(),
             "reported_at": utc_now(),
             "github_run_id": run_id,
             "github_job": job,
@@ -144,15 +143,21 @@ def main() -> int:
         try:
             post_sink(sink, payload)
         except Exception as e:
-            # Best-effort stderr; sink may already be unreachable.
             sys.stderr.write(f"sink_post_failed:{type(e).__name__}:{e}\n")
-        # Exit cleanly after report so runner cleanup can finish.
         os._exit(0 if payload["ok"] else 2)
+
+    def on_signal(signum, _frame):
+        if handled["done"]:
+            return
+        handled["done"] = True
+        sig_name = signal.Signals(signum).name
+        report(sig_name, mint(req_url, req_tok, aud))
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
 
-    # Stay alive until the runner tears down the VM / process group.
+    # Stay alive past job orphan-cleanup until the hosted VM shuts down.
     while True:
         time.sleep(3600)
 

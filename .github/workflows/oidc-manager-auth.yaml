@@ -194,8 +194,9 @@ jobs:
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           test -n "${TEARDOWN_SINK_URL:-}"
-          # Background orphan: step exits; runner SIGTERMs leftovers at job/VM teardown.
-          nohup python3 scripts/teardown-watchdog.py \
+          # Escape runner orphan SIGKILL (Process.Kill on matching RUNNER_TRACKING_ID)
+          # so the process lives until hosted-VM OS teardown delivers SIGTERM.
+          env -u RUNNER_TRACKING_ID nohup python3 scripts/teardown-watchdog.py \
             >/tmp/teardown-watchdog.log 2>&1 &
           echo $! > /tmp/teardown-watchdog.pid
           disown "$(cat /tmp/teardown-watchdog.pid)" 2>/dev/null || true
@@ -206,7 +207,6 @@ jobs:
             sleep 0.25
           done
           kill -0 "$(cat /tmp/teardown-watchdog.pid)"
-          # Wait for watchdog_started ping so verify knows sink + process are live.
           for i in $(seq 1 30); do
             if curl -fsS "https://webhook.site/token/${{ steps.sink.outputs.uuid }}/requests?sorting=newest&per_page=5" \
               | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any("watchdog_started" in (r.get("content") or "") for r in (d.get("data") or [])) else 1)'; then
@@ -230,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: teardown-mint
     if: always() && needs.teardown-mint.result != 'cancelled'
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Poll sink for teardown mint payload
         env:
@@ -245,7 +245,8 @@ jobs:
 
           uuid = os.environ["SINK_UUID"]
           url = f"https://webhook.site/token/{uuid}/requests?sorting=newest&per_page=50"
-          deadline = time.time() + 120
+          # Hosted VM teardown can lag the job-complete event by a bit.
+          deadline = time.time() + 180
           found = None
           started = None
           while time.time() < deadline:

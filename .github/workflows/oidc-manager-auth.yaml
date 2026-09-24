@@ -265,7 +265,6 @@ jobs:
                       and payload.get("window") == "gh_hosted_vm_teardown_sigterm"
                   ):
                       found = payload
-                      break
               if found:
                   break
               time.sleep(3)

@@ -1,3 +1,5 @@
+# DEPRECATED as proof path — use oidc-manager-auth-action-user.yaml (Action + manager-auth: oidc).
+# Kept for historical reference; do not cite these runs as the normal-user proof.
 # Normal-user style OIDC Manager auth demo on a private self-hosted Linux lab runner.
 #
 # Operator path: long-lived Manager (systemd) + host Agent (systemd) + moto S3 sink.

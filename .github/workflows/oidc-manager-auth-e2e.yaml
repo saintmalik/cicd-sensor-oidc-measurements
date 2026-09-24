@@ -1,3 +1,5 @@
+# DEPRECATED as proof path — use oidc-manager-auth-action-user.yaml (Action + manager-auth: oidc).
+# Kept for historical reference; do not cite these runs as the normal-user proof.
 # Same-job colocated Manager OIDC e2e (prod crypto path).
 #
 # Proves: real GitHub Actions ID token mint → Manager verify via real GitHub

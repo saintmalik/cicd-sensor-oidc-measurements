@@ -1,3 +1,5 @@
+# DEPRECATED as proof path — use oidc-manager-auth-action-user.yaml (Action + manager-auth: oidc).
+# Kept for historical reference; do not cite these runs as the normal-user proof.
 # Full OIDC Manager Auth validation — every @rung concern + long remint.
 #
 # Private repo only: saintmalik/cicd-sensor-oidc-measurements
